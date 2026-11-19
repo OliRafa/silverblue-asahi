@@ -1,0 +1,36 @@
+#!/bin/bash
+# silverblue-asahi-primary-user — print the primary user as "UID NAME", or exit 1 when there is none.
+#
+# The image ships no human account. GNOME Initial Setup creates the first one from GDM, during the
+# first boot's graphical session, so units that act on that account (silverblue-asahi-brew-setup)
+# start before it exists. They use this as an ExecCondition=: exit 1 skips the unit (inactive, not
+# failed), and its timer tries again until the account is there.
+#
+# The primary user is the lowest uid in login.defs' UID_MIN..UID_MAX range with a real login shell.
+# The bounds come from login.defs — what useradd (and so GNOME Initial Setup, through accountsservice)
+# allocates from — not a hand-rolled 1000..65000: systemd's DynamicUser= accounts sit at 61184-65519
+# and nss-systemd surfaces them in `getent passwd`. On Asahi, speakersafetyd runs exactly that way
+# (uid 62454); counted as a human, it would stand in for an account that does not exist yet.
+#
+# passwd fields are name:passwd:uid:gid:gecos:home:shell — the NAME is $1. Printing $2 yields the
+# password placeholder "x", which is the bug that once kept brew from ever installing.
+#
+# Exit status: 0 with "UID NAME" on stdout, or 1 (and a note on stderr) when no such account exists.
+set -uo pipefail
+
+# Overridable so the logic is testable without a container (test/unit.d/brew-setup-test.sh).
+login_defs="${SILVERBLUE_ASAHI_LOGIN_DEFS:-/etc/login.defs}"
+
+uid_min=$(awk '$1 == "UID_MIN" { print $2 }' "$login_defs" 2>/dev/null)
+uid_max=$(awk '$1 == "UID_MAX" { print $2 }' "$login_defs" 2>/dev/null)
+uid_min=${uid_min:-1000}
+uid_max=${uid_max:-60000}
+
+primary=$(getent passwd | awk -F: -v lo="$uid_min" -v hi="$uid_max" \
+  '$3>=lo && $3<=hi && $7 !~ /nologin|false/ {print $3, $1}' | sort -n | head -1)
+
+if [[ -z $primary ]]; then
+  echo "primary-user: no human account yet (GNOME Initial Setup creates it at the first login screen)" >&2
+  exit 1
+fi
+printf '%s\n' "$primary"

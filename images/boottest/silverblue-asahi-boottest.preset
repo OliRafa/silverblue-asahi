@@ -1,0 +1,3 @@
+# The boot test runs on hardware. Should a preset pass ever run on it (see 50-silverblue-asahi.preset),
+# it would disable a unit no preset lists.
+enable silverblue-asahi-boottest.service

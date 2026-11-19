@@ -1,0 +1,296 @@
+# silverblue-asahi — Fedora Silverblue (GNOME) as a bootc image for Apple Silicon (aarch64)
+#
+# Fedora Asahi Remix's Silverblue image, which is GNOME as Fedora ships it (GDM, GNOME Initial Setup,
+# Firefox, Ptyxis, GNOME Software), plus what it takes to run it as a plain bootc OS on a Mac:
+# systemd-boot on the composefs backend, a composefs-capable initramfs, the m1n1/devicetree refresh,
+# first-boot Flatpak and Homebrew provisioning, Docker and system tuning. The desktop itself is left
+# alone: nothing here themes, reconfigures or replaces GNOME. The one exception is GNOME Software's
+# OS-package plugins, which cannot work on a composefs install (step 3).
+#
+# One helper stage only supplies files: `brew` (Universal Blue's prebuilt Homebrew tree).
+#
+# Build on a native aarch64 host or an arm64 CI runner (see images/build.sh):
+#   ./images/build.sh              # -> silverblue-asahi:44
+
+ARG BASE=quay.io/fedora-asahi-remix-atomic-desktops/silverblue
+ARG FEDORA=44
+
+# Homebrew comes from Universal Blue's brew image — the same one Bluefin and Bazzite consume. It is
+# a `FROM scratch` context image holding only /system_files: a prebuilt, zstd-compressed Homebrew
+# tree at /usr/share/homebrew.tar.zst plus the units and shell hooks that manage it. Built for both
+# amd64 and arm64, so the aarch64 tree we need is the one we get.
+#
+# Taking the prebuilt tree rather than running Homebrew's installer at first boot is the point:
+# every brew failure seen on this platform was a first-boot network failure, and one was invisible
+# because `bash -c "$(curl ...)"` exits 0 when the curl fails.
+#
+# NOTE: this is a third-party image baked into the OS — a real trust dependency. Pin BREW_IMAGE to a
+# digest if that tradeoff ever needs tightening.
+ARG BREW_IMAGE=ghcr.io/ublue-os/brew:latest
+FROM ${BREW_IMAGE} AS brew
+
+FROM ${BASE}:${FEDORA}
+
+# 1) Packages. The base already carries the Asahi kernel (kernel-16k), Apple firmware, m1n1/U-Boot
+#    glue, dracut, the Asahi audio DSP stack and the whole GNOME desktop; packages/platform.packages
+#    adds systemd-boot, Docker, the provisioning tools and a few CLI basics. Inline comments and
+#    blank lines are stripped. Fedora mirrors flake often enough on CI to retry (clean metadata +
+#    linear backoff) before giving up.
+COPY packages/platform.packages /tmp/platform.packages
+RUN retry() { n=1; while ! "$@"; do [ "$n" -ge 5 ] && return 1; echo "[dnf-retry] attempt $n failed: $*"; dnf clean all || true; sleep $((n*5)); n=$((n+1)); done; }; \
+    retry dnf -y install $(sed 's/#.*//' /tmp/platform.packages | awk 'NF') \
+ && dnf clean all \
+ && rm -f /tmp/platform.packages
+
+# 2) Bootloader: systemd-boot; drop the tooling bootc does not use.
+#    - bootc selects systemd-boot when bootupd is ABSENT (and we pass --bootloader systemd at
+#      install). bootupd manages GRUB/shim only — never systemd-boot — so it goes. Nothing in the
+#      base requires it; the build fails if it survives.
+#    - GRUB and shim stay installed but inert: dnf protects shim-aa64, which requires
+#      grub2-efi-aa64, and asahi-platform-metapackage holds grub2-common. --bootloader systemd is
+#      authoritative, and the install-to-disk check asserts no GRUB lands on the ESP. Removing them
+#      in the same transaction as bootupd would fail the whole transaction and remove nothing.
+#    - rpm-ostree stays too: tuned (the base's power-profile daemon, behind tuned-ppd) requires it,
+#      and removing it takes tuned and tuned-ppd along. It is inert on the composefs backend.
+#    On Asahi the chain is m1n1 → U-Boot (UEFI) → /EFI/BOOT/BOOTAA64.EFI (systemd-boot) → kernel;
+#    the devicetree comes from m1n1, not from here.
+#
+#    Then mask grub2's boot-success units. They ship with grub2-common and record a successful boot
+#    by writing a grubenv via grub2-editenv. Under systemd-boot there is no grubenv, so they fail on
+#    every boot (the user one at every login). `systemctl mask` works on units that do not exist, so
+#    this is safe if grub2-common ever goes.
+RUN set -eux; \
+    if rpm -q bootupd >/dev/null 2>&1; then dnf -y remove bootupd; fi; \
+    ! rpm -q bootupd >/dev/null 2>&1 || { echo "[2] bootupd is still installed"; exit 1; }; \
+    for p in rpm-ostree grub2-efi-aa64 shim-aa64; do \
+      rpm -q "$p" >/dev/null 2>&1 && echo "[2] kept (held by a dependency, inert under systemd-boot): $p" || echo "[2] absent: $p"; \
+    done; \
+    dnf clean all; \
+    systemctl --global mask grub-boot-success.timer grub-boot-success.service; \
+    systemctl mask grub-boot-indeterminate.service; \
+    for u in /etc/systemd/user/grub-boot-success.timer \
+             /etc/systemd/user/grub-boot-success.service \
+             /etc/systemd/system/grub-boot-indeterminate.service; do \
+      [ "$(readlink -f "$u")" = /dev/null ] || { echo "[2] $u is not masked"; exit 1; }; \
+    done
+
+# 3) OS updates come from `bootc upgrade`, not GNOME Software. GNOME Software has two OS-package
+#    plugins here, and neither can work on a composefs-backend install:
+#     - rpm-ostree manages an ostree sysroot through rpm-ostreed, which this install does not have.
+#       Its package is separate, so remove it.
+#     - dnf5 installs and updates RPMs through dnf5daemon-server on a read-only /usr. The only thing
+#       that turns it off is the rpm-ostree plugin's conflict rule (Fedora's 0001-dnf5-plugin.patch),
+#       added only when /run/ostree-booted exists; its own setup just connects to the system bus. So
+#       without the rpm-ostree plugin it would offer RPM updates it cannot apply. It ships inside
+#       gnome-software itself, which also requires dnf5daemon-server, so delete the plugin file:
+#       GNOME Software loads whatever is in its plugin directory.
+#    That leaves GNOME Software doing what it can here: Flatpaks and firmware (fwupd).
+RUN set -eux; \
+    if rpm -q gnome-software-rpm-ostree >/dev/null 2>&1; then dnf -y remove gnome-software-rpm-ostree; fi; \
+    ! rpm -q gnome-software-rpm-ostree >/dev/null 2>&1 || { echo "[3] gnome-software-rpm-ostree is still installed"; exit 1; }; \
+    rpm -q gnome-software >/dev/null || { echo "[3] removing the plugin took GNOME Software with it"; exit 1; }; \
+    plugins="$(rpm -ql gnome-software | grep -E '/gnome-software/plugins-[0-9]+/libgs_plugin_flatpak\.so$')"; \
+    plugin_dir="${plugins%/*}"; \
+    rm -f "$plugin_dir/libgs_plugin_dnf5.so"; \
+    [ ! -e "$plugin_dir/libgs_plugin_dnf5.so" ] && [ ! -e "$plugin_dir/libgs_plugin_rpm-ostree.so" ] \
+      || { echo "[3] an OS-package plugin is still in $plugin_dir"; exit 1; }; \
+    [ -f "$plugin_dir/libgs_plugin_flatpak.so" ] || { echo "[3] GNOME Software lost its Flatpak plugin"; exit 1; }; \
+    dnf clean all
+
+# 4) The platform overlay: m1n1/provisioning units and helpers, system tuning drop-ins, the Apple
+#    HID modprobe/dracut configuration, Docker's socket and daemon settings, and
+#    50-silverblue-asahi.preset, which lists every unit this image enables or disables. Copied AFTER
+#    the package install so the packages' %config files (cups-browsed.conf) are replaced rather than
+#    left as .rpmnew, and BEFORE step 5 so the initramfs picks up the dracut and modprobe drop-ins.
+COPY system/platform/ /
+RUN chmod 0755 /usr/libexec/silverblue-asahi-* /usr/bin/silverblue-asahi-* /usr/lib/systemd/system-sleep/silverblue-asahi-* \
+ && chmod 0440 /etc/sudoers.d/silverblue-asahi-* \
+ && visudo -cf /etc/sudoers.d/silverblue-asahi-passwd-tries
+
+# 5) composefs boot: rebuild the initramfs with bootc's dracut module.
+#    The base image's initramfs is built for the OSTREE backend: it ships ostree-prepare-root.service
+#    gated on ConditionKernelCommandLine=ostree and nothing that reads `composefs=`. Install with
+#    --composefs-backend against that and the boot entry carries composefs=<digest> that no
+#    initramfs component consumes — the kernel mounts root= directly and you boot the IMAGE's kernel
+#    against whatever /usr is already on the disk (observed on hardware: emergency mode).
+#
+#    bootc ships /usr/lib/dracut/modules.d/51bootc (module `bootc`) which installs
+#    /usr/lib/bootc/initramfs-setup + bootc-root-setup.service. Rebuild
+#    /usr/lib/modules/<kver>/initramfs.img with it — exactly what the composefs install copies to
+#    <ESP>/EFI/Linux/bootc_composefs-<digest>/initrd — and FAIL the build if the result lacks the
+#    unit, or lacks the Apple HID drivers usr/lib/dracut/dracut.conf.d/90-silverblue-asahi-apple-hid.conf
+#    forces in (the trackpad boot race fix; see docs/asahi.md).
+#
+#    DRACUT_NO_XATTR / DRACUT_NO_MKNOD: dracut sets these itself when it detects a container; that
+#    detection does not fire here, and the xattr copy failures would otherwise log once per file.
+#    /var/roothome: /root is a symlink to var/roothome and /var is empty in the image, so
+#    dracut-install dies on the dangling link; create it for the run only, keeping /var empty for
+#    `bootc container lint`.
+RUN set -eux; \
+    export DRACUT_NO_XATTR=1 DRACUT_NO_MKNOD=1; \
+    kver="$(basename "$(dirname "$(find /usr/lib/modules -maxdepth 2 -name vmlinuz | head -1)")")"; \
+    moddir="$(ls -d /usr/lib/dracut/modules.d/*bootc 2>/dev/null | head -1)"; \
+    [ -n "$moddir" ] || { echo "[5] no bootc dracut module — composefs installs cannot pivot"; exit 1; }; \
+    modname="$(basename "$moddir" | sed 's/^[0-9]*//')"; \
+    echo "[5] rebuilding initramfs for $kver with dracut module '$modname' ($moddir)"; \
+    if [ -e /var/roothome ]; then roothome_made=0; else mkdir -p /var/roothome; roothome_made=1; fi; \
+    dracut --force --no-hostonly --reproducible --kver "$kver" \
+      --add "$modname" "/usr/lib/modules/$kver/initramfs.img"; \
+    if [ "$roothome_made" = 1 ]; then rmdir /var/roothome; fi; \
+    { set +x; } 2>/dev/null; \
+    contents="$(lsinitrd "/usr/lib/modules/$kver/initramfs.img")"; \
+    echo "$contents" | grep -q 'bootc-root-setup\.service' \
+      || { echo "[5] rebuilt initramfs lacks bootc-root-setup.service"; exit 1; }; \
+    for m in hid-apple hid-magicmouse; do \
+      if grep -q "/$m\.ko" "/usr/lib/modules/$kver/modules.builtin"; then echo "[5] $m is built in"; continue; fi; \
+      echo "$contents" | grep -q "/$m\.ko" || { echo "[5] initramfs lacks $m.ko (Apple HID early load)"; exit 1; }; \
+    done; \
+    echo "[5] initramfs carries bootc composefs root setup + Apple HID drivers"
+
+# 6) Asahi + atomic: update-m1n1 is a MANUAL step on bootc, and by default reads the STATIC
+#    devicetree in /boot rather than the image's — so a kernel devicetree change (the 6.19 USB DT)
+#    boots stale and breaks hardware. Point DTBS at the image's devicetree (update-m1n1 globs
+#    $DTBS/apple/t6*.dtb and t81*.dtb) and enable silverblue-asahi-apply-m1n1.service, which runs
+#    update-m1n1 once per kernel. It only runs on a boot that came through m1n1 (the unit's
+#    ConditionPathExists on the devicetree node m1n1 sets).
+RUN set -eux; \
+    mkdir -p /etc/sysconfig; f=/etc/sysconfig/update-m1n1; touch "$f"; \
+    if grep -q '^DTBS=' "$f"; then \
+      sed -i 's|^DTBS=.*|DTBS="/usr/lib/modules/$(uname -r)/dtb"|' "$f"; \
+    else \
+      printf 'DTBS="/usr/lib/modules/$(uname -r)/dtb"\n' >>"$f"; \
+    fi; \
+    systemctl enable silverblue-asahi-apply-m1n1.service
+
+# 7) Homebrew + Flatpak first-boot provisioning. Neither can live in /usr as a working install:
+#    Homebrew needs a writable prefix owned by a human user, and Flatpaks live in /var/lib/flatpak,
+#    which bootc only seeds on first boot.
+#
+#    Homebrew is only UNPACKED at first boot: ublue's brew-setup.service extracts
+#    /usr/share/homebrew.tar.zst into /home/linuxbrew, and brew-update.timer / brew-upgrade.timer
+#    keep it current afterwards. silverblue-asahi-brew-setup.service re-owns the prefix to the
+#    primary user and applies /usr/share/silverblue-asahi/Brewfile, once GNOME Initial Setup has
+#    created that user. ublue's update units run as a fixed uid 1000; drop-ins in the platform
+#    overlay hold them until the Brewfile is applied and run them as the prefix's owner.
+#
+#    Flatpaks use Fedora/flatpak's upstream `flatpak preinstall` (manifests under
+#    /usr/share/flatpak/preinstall.d — step 9 ships the app set). The Flathub remote is baked in as a
+#    LOCAL file so registering it at first boot downloads nothing; the build fails rather than ship
+#    an image whose remote step is back on the network. flatpak-add-fedora-repos.service is masked:
+#    it would add Fedora's remotes (including fedora-testing) at Flathub's priority, and Fedora wins
+#    priority ties. The preinstall unit adds Fedora's stable remote itself, below Flathub, for the one
+#    app Flathub lacks on aarch64 (OBS).
+#
+#    The Brewfile and the Flatpak app set install from TIMERS, not from multi-user.target.
+#    NetworkManager-wait-online is masked (step 8), so a boot-time start runs before Wi-Fi is up:
+#    `brew bundle` fails, and offline `flatpak preinstall` exits 0 having installed nothing.
+#    The timers start their service 30s after boot and again every 2 minutes while its conditions
+#    skip it (the hosts it needs do not answer over HTTPS yet; for brew, also while no user exists).
+#    A failed preinstall is retried by its timer; a failed `brew bundle` backs off instead (Restart=
+#    in the unit). The services have no [Install] section of their own.
+COPY --from=brew /system_files/ /
+COPY Brewfile /usr/share/silverblue-asahi/Brewfile
+RUN set -eux; \
+    [ -s /usr/share/homebrew.tar.zst ] || { echo "[7] brew image shipped no homebrew.tar.zst"; exit 1; }; \
+    command -v flatpak >/dev/null || { echo "[7] flatpak (for the preinstall CLI) not installed"; exit 1; }; \
+    mkdir -p /etc/flatpak/remotes.d; \
+    curl --retry 3 --retry-delay 2 -fL -o /etc/flatpak/remotes.d/flathub.flatpakrepo \
+      https://dl.flathub.org/repo/flathub.flatpakrepo; \
+    [ -s /etc/flatpak/remotes.d/flathub.flatpakrepo ] || { echo "[7] failed to bake flathub.flatpakrepo"; exit 1; }; \
+    systemctl mask flatpak-add-fedora-repos.service; \
+    systemctl enable silverblue-asahi-flatpak-preinstall.timer silverblue-asahi-flatpak-update.timer silverblue-asahi-brew-setup.timer; \
+    systemctl enable brew-setup.service brew-update.timer brew-upgrade.timer
+
+# 8) System services. Nothing in the session needs to block on the network, so mask
+#    NetworkManager-wait-online and let network-online.target pass without waiting for DHCP/Wi-Fi
+#    association; the units that need the network wait for it themselves instead
+#    (silverblue-asahi-online conditions, retried from timers; step 7). Power profiles come from the
+#    base's tuned + tuned-ppd (power-profiles-daemon would conflict with tuned-ppd). systemd-oomd's
+#    [Install] pulls in systemd-oomd.socket, which the user manager reports its kill candidates over.
+#    The base leaves cups to socket activation and cups-browsed off; both run from boot here so
+#    driverless network printers are discovered (/etc/cups/cups-browsed.conf).
+#
+#    SSH is opt-in. The base enables sshd and its default firewalld zone allows ssh, so a laptop
+#    would accept password logins from the network out of the box. Disable the unit
+#    (/usr/lib/systemd/system-preset/50-silverblue-asahi.preset keeps a preset pass from re-enabling
+#    it) and drop ssh from the default zone. Both halves tolerate a base image that no longer has
+#    them: sshd is disabled only if its unit ships, and the zone is queried before ssh is removed;
+#    then assert the zone no longer allows it.
+#
+#    dnf-makecache.timer is off. Fedora enables it everywhere and its units skip themselves on an
+#    ostree boot (ConditionPathExists=!/run/ostree-booted); a composefs-native boot writes no such
+#    file, so here it would download dnf metadata every 3 hours for a /usr nothing can install into.
+#    The opposite case, units that only run on ostree, is handled by drop-ins in the platform overlay
+#    (bootc-fetch-apply-updates, the atomic-desktop AppStream and man-db refreshes).
+RUN set -eux; \
+    systemctl enable NetworkManager.service bluetooth.service firewalld.service \
+      systemd-resolved.service avahi-daemon.service tuned.service tuned-ppd.service \
+      cups.service cups-browsed.service docker.socket systemd-oomd.service fstrim.timer; \
+    systemctl mask NetworkManager-wait-online.service; \
+    systemctl disable dnf-makecache.timer; \
+    ! systemctl is-enabled --quiet dnf-makecache.timer || { echo "[8] dnf-makecache.timer is still enabled"; exit 1; }; \
+    if [ -f /usr/lib/systemd/system/sshd.service ]; then systemctl disable sshd.service; fi; \
+    zone="$(firewall-offline-cmd --get-default-zone)"; \
+    if firewall-offline-cmd --zone="$zone" --query-service=ssh; then \
+      firewall-offline-cmd --zone="$zone" --remove-service-from-zone=ssh; \
+    fi; \
+    if firewall-offline-cmd --zone="$zone" --query-service=ssh; then \
+      echo "[8] ssh is still allowed in the $zone zone"; exit 1; \
+    fi
+
+# 9) The desktop overlay: the Flatpak app set (GNOME's default apps, which Silverblue's installer
+#    normally adds and `bootc install` does not, plus a handful of everyday apps) and the LocalSend
+#    firewalld service, opened in the default zone (the base's "public" zone allows neither its
+#    discovery nor its transfers). Then assert the desktop is still the base's: GDM is the display
+#    manager, the system boots to graphical.target, and GNOME Initial Setup is there to create the
+#    first account (the image ships no user, and nothing else creates one).
+#
+#    Firefox: Fedora's /usr/bin/firefox COPIES the language pack into the profile on ostree and
+#    symlinks it elsewhere, because every file of an ostree deployment has mtime 0 and Firefox, which
+#    notices a changed add-on by its mtime, would keep the old langpack after an update (it then no
+#    longer matches the browser's version and is disabled: a non-English Firefox turns English). It
+#    detects ostree by /run/ostree-booted, which a composefs-native boot never writes, though its
+#    files have mtime 0 too. Test for the cause instead: copy whenever the langpack's mtime is 0.
+COPY system/desktop/ /
+RUN set -eux; \
+    [ -s /usr/share/flatpak/preinstall.d/silverblue-asahi.preinstall ] || { echo "[9] Flatpak app set missing"; exit 1; }; \
+    zone="$(firewall-offline-cmd --get-default-zone)"; \
+    firewall-offline-cmd --zone="$zone" --add-service=localsend; \
+    firewall-offline-cmd --zone="$zone" --query-service=localsend; \
+    [ "$(readlink -f /etc/systemd/system/display-manager.service)" = /usr/lib/systemd/system/gdm.service ] \
+      || { echo "[9] GDM is not the display manager"; exit 1; }; \
+    [ "$(systemctl get-default)" = graphical.target ] || { echo "[9] the default target is not graphical.target"; exit 1; }; \
+    [ -x /usr/libexec/gnome-initial-setup ] || { echo "[9] GNOME Initial Setup is missing: nothing would create the first account"; exit 1; }; \
+    ostree_test='            if [ -e "/run/ostree-booted" ]; then'; \
+    [ "$(grep -cxF "$ostree_test" /usr/bin/firefox)" = 1 ] \
+      || { echo "[9] /usr/bin/firefox no longer has the ostree langpack test this step patches"; exit 1; }; \
+    sed -i 's|^            if \[ -e "/run/ostree-booted" \]; then$|            if [ -e "/run/ostree-booted" ] \|\| [ "$(stat -c %Y "$MOZ_LANGPACKS_DIR/$langpack" 2>/dev/null)" = "0" ]; then|' /usr/bin/firefox; \
+    grep -qF '[ "$(stat -c %Y "$MOZ_LANGPACKS_DIR/$langpack" 2>/dev/null)" = "0" ]' /usr/bin/firefox \
+      || { echo "[9] patching the Firefox langpack test failed"; exit 1; }; \
+    bash -n /usr/bin/firefox
+
+# 10) Ship /etc/machine-id EMPTY, then clear build residue and lint.
+#
+#     machine-id(5): systemd treats a boot as the first one when /etc/machine-id is absent or reads
+#     "uninitialized", and an empty file is NOT a first boot. That is what the base ships and what
+#     this image keeps: a first boot would run systemd-firstboot, which asks for the locale, keymap,
+#     timezone and a root password on the console before GDM starts, and GNOME Initial Setup asks the
+#     same questions graphically. With an empty file systemd generates the ID on the first boot and
+#     commits it, and no full preset pass runs (50-silverblue-asahi.preset still covers every unit,
+#     should one ever run). Written in this last step so that nothing an earlier step ran (a package
+#     scriptlet, say) can leave a real ID, or "uninitialized", baked into the image.
+#
+#     Build residue: the image must be bootc-clean (no content in /run, /tmp, /var/log or dnf
+#     caches — these trip the nonempty-run-tmp / var-log / var-tmpfiles lints). Target specific
+#     residue dirs, not /run/* wholesale: the build engine bind-mounts
+#     /run/systemd/resolve/stub-resolv.conf for build DNS, which cannot be removed. /var only
+#     reaches a deployment on its first install, so packaged /var content goes too and is created at
+#     boot instead: plocate's directory by /usr/lib/tmpfiles.d/silverblue-asahi-plocate.conf, and
+#     ldconfig's aux-cache, a pure cache, by the next ldconfig run.
+RUN : >/etc/machine-id \
+ && [ -f /etc/machine-id ] && [ ! -s /etc/machine-id ] \
+ && rm -rf /var/cache/dnf /var/cache/libdnf5 /var/lib/dnf/repos /var/lib/dnf/history* \
+ && rm -rf /var/lib/plocate /var/cache/ldconfig/aux-cache \
+ && rm -f /var/log/dnf5.log* /var/log/dnf.log* /var/log/hawkey.log* \
+ && rm -rf /run/dnf /tmp/* \
+ && bootc container lint

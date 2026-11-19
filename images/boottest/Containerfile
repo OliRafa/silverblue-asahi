@@ -1,0 +1,18 @@
+# On-hardware boot-test overlay on top of a built silverblue-asahi image. It adds a gated unit that
+# runs boot-smoke.sh at boot and reports over the console and journal — nothing test-related lands
+# in a published image.
+#
+#   podman build -t silverblue-asahi:44-boottest --build-arg BASE=silverblue-asahi:44 \
+#     -f images/boottest/Containerfile .
+#
+# Deploy the -boottest image on a real Mac (bootc switch, or deploy/silverblue-asahi-install) and
+# read the verdict from `journalctl -u silverblue-asahi-boottest`: "BOOT SMOKE: PASS".
+ARG BASE=silverblue-asahi:44
+FROM ${BASE}
+
+COPY images/boottest/boot-smoke.sh /usr/libexec/silverblue-asahi-boot-smoke
+COPY images/boottest/silverblue-asahi-boottest.service /usr/lib/systemd/system/silverblue-asahi-boottest.service
+COPY images/boottest/silverblue-asahi-boottest.preset /usr/lib/systemd/system-preset/50-silverblue-asahi-boottest.preset
+RUN chmod +x /usr/libexec/silverblue-asahi-boot-smoke \
+ && systemctl enable silverblue-asahi-boottest.service \
+ && bootc container lint

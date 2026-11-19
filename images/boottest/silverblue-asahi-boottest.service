@@ -1,0 +1,16 @@
+[Unit]
+Description=silverblue-asahi boot smoke test (on-device only)
+After=multi-user.target gdm.service NetworkManager.service silverblue-asahi-apply-m1n1.service
+Wants=gdm.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Give GDM time to bring up its gnome-shell before checking for it.
+ExecStartPre=/usr/bin/sleep 20
+StandardOutput=journal+console
+StandardError=journal+console
+ExecStart=/usr/libexec/silverblue-asahi-boot-smoke
+
+[Install]
+WantedBy=multi-user.target

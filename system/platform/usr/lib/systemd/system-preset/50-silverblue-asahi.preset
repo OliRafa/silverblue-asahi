@@ -1,0 +1,56 @@
+# silverblue-asahi's service presets. systemd reads the preset files of every directory as one list
+# sorted by file name, and the first line that matches a unit wins, so this file (50-) overrides the
+# base's 81-, 85-, 90- and 99- files.
+#
+# A preset pass sets every unit to what the presets say, and Fedora's 99-default-disable.preset says
+# `disable *` for anything not listed. The image ships /etc/machine-id empty, so an install's first
+# boot is not a "first boot" to systemd and runs no full preset pass today. This file still lists
+# every unit images/silverblue-asahi/Containerfile enables or disables, so that a preset pass, from a
+# `systemctl preset-all` by hand or a future first-boot policy, keeps the image as built;
+# platform-smoke.sh asserts that a full `systemctl preset-all` changes nothing. Masks are left alone
+# by presets.
+
+# SSH is opt-in (step 8): the base enables sshd. To turn it on yourself:
+# `sudo systemctl enable --now sshd`, then let it through the firewall with
+# `sudo firewall-cmd --permanent --add-service=ssh && sudo firewall-cmd --reload`.
+disable sshd.service
+
+# dnf-makecache skips itself only on an ostree boot, and a composefs-native boot is not one, so here
+# it would download dnf metadata every 3 hours for a read-only /usr (step 8). 90-default.preset
+# enables it.
+disable dnf-makecache.timer
+
+# systemd-homed-firstboot runs `homectl firstboot --prompt-new-user` on a first boot, before user
+# sessions start. Nothing enables it today (99-default-disable), but if a preset ever did, the console
+# would ask for an account before GNOME Initial Setup asks for one too, and the machine would end up
+# with two.
+disable systemd-homed-firstboot.service
+
+# The m1n1 refresh and first-boot provisioning (steps 6-7). silverblue-asahi-flatpak-preinstall.service
+# and silverblue-asahi-brew-setup.service have no [Install] section (their timers start them), so a
+# preset pass leaves them alone and only the timers are listed.
+enable silverblue-asahi-apply-m1n1.service
+enable silverblue-asahi-flatpak-preinstall.timer
+enable silverblue-asahi-flatpak-update.timer
+enable silverblue-asahi-brew-setup.timer
+enable brew-setup.service
+enable brew-update.timer
+enable brew-upgrade.timer
+
+# System services (step 8). The base's presets enable most of these too; listing them keeps the
+# image's choice from depending on that. The base leaves cups.service to socket activation (cups.socket,
+# cups.path) and does not enable cups-browsed at all; this image runs both from boot so driverless
+# network printers are discovered (/etc/cups/cups-browsed.conf). Power profiles are tuned's, behind
+# tuned-ppd.
+enable NetworkManager.service
+enable bluetooth.service
+enable firewalld.service
+enable systemd-resolved.service
+enable avahi-daemon.service
+enable tuned.service
+enable tuned-ppd.service
+enable cups.service
+enable cups-browsed.service
+enable docker.socket
+enable systemd-oomd.service
+enable fstrim.timer

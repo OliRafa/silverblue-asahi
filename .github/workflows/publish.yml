@@ -1,0 +1,82 @@
+name: Publish image (GHCR)
+
+# Release the image that "Image e2e" just tested: e2e pushes it as the immutable :44-<sha> tag once
+# the smoke tests and both installs have passed, and calls this with its digest, for a push to main,
+# its weekly run or a manual run of it (never a pull request). This tags that digest and cosign-signs
+# it (keyless, via GitHub OIDC), so what machines pull is byte for byte what e2e tested, with no
+# second build.
+#
+#   ghcr.io/<owner>/silverblue-asahi:44            the image (GNOME, stock Asahi kernel-16k; arm64 only)
+#   ghcr.io/<owner>/silverblue-asahi:latest        the same digest
+#   ghcr.io/<owner>/silverblue-asahi:44-<sha>      immutable, pushed by e2e
+on:
+  workflow_call:
+    inputs:
+      digest:
+        description: Digest of the silverblue-asahi image Image e2e tested and pushed as silverblue-asahi:44-<sha>
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write        # cosign keyless (Fulcio/Rekor via GitHub OIDC)
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: publish-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      FEDORA: "44"
+      ARCH: arm64
+      DIGEST: ${{ inputs.digest }}
+    steps:
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | skopeo login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Same repository, so a copy moves no layers: it writes the tested manifest under the new tag,
+      # and --preserve-digests fails it rather than let the digest change.
+      - name: Tag the tested image
+        id: push
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/silverblue-asahi"
+          [[ $DIGEST == sha256:* ]] || { echo "Image e2e handed over no digest: '$DIGEST'"; exit 1; }
+          arch="$(skopeo inspect --format '{{.Architecture}}' "docker://$repo@$DIGEST")"
+          [[ $arch == "$ARCH" ]] || { echo "$repo@$DIGEST is $arch, not $ARCH"; exit 1; }
+          for t in "$FEDORA" latest; do
+            skopeo copy --preserve-digests "docker://$repo@$DIGEST" "docker://$repo:$t"
+          done
+          echo "ref=$repo@$DIGEST" >> "$GITHUB_OUTPUT"
+
+      # Pinned to a commit: this job can sign and push, so a moved tag must not change what runs here.
+      # v3 installs cosign 2, whose classic signature (the sha256-<digest>.sig tag) is the one a
+      # containers-policy.json sigstoreSigned entry verifies (deploy/README.md); cosign-installer v4
+      # installs cosign 3, which defaults to the newer bundle format.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5   # v3.10.1 (cosign v2.6.1)
+
+      - name: Sign the image (keyless)
+        env:
+          COSIGN_YES: "true"
+        run: |
+          # cosign (go-containerregistry) reads the docker config, not skopeo's auth.json.
+          cosign login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
+          cosign sign "${{ steps.push.outputs.ref }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published + signed"
+            echo ""
+            echo "- \`${{ steps.push.outputs.ref }}\` (\`$FEDORA\`, \`latest\`, \`$FEDORA-${GITHUB_SHA::12}\`)"
+          } >> "$GITHUB_STEP_SUMMARY"

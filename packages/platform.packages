@@ -1,0 +1,85 @@
+# silverblue-asahi packages — Fedora/Asahi system packages layered onto
+# quay.io/fedora-asahi-remix-atomic-desktops/silverblue. The base already carries the Asahi kernel
+# (kernel-16k), Apple firmware, m1n1/U-Boot glue, dracut, the Asahi audio stack (asahi-audio,
+# speakersafetyd, the lv2 DSP plugins) and the whole GNOME desktop; this list adds what a bootc
+# laptop OS needs on top. Nothing here is a desktop package: GNOME stays exactly as the base ships it.
+#
+# Several entries are already in the base. They are listed because a unit, a helper or a drop-in in
+# this repo depends on them, so the image keeps them should the base ever drop one.
+#
+# One package per line; text after `#` is ignored (images/silverblue-asahi/Containerfile strips it).
+
+# --- Boot: systemd-boot replaces GRUB on this image (see images/silverblue-asahi/Containerfile step 2) ---
+systemd-boot-unsigned
+
+# --- Apple Silicon extras. The base ships all three (asahi-platform-metapackage-core requires
+# tiny-dfr and widevine-installer); listed so they stay should the base drop them ---
+tiny-dfr                    # Touch Bar function-row daemon (MacBook Pro 13" M1/M2)
+widevine-installer          # aarch64 Widevine CDM fetcher; see silverblue-asahi-widevine
+mesa-vulkan-drivers         # Honeykrisp (Asahi Vulkan)
+
+# --- Networking ---
+NetworkManager
+NetworkManager-tui
+wpa_supplicant              # NM's Wi-Fi backend on Fedora Asahi (brcmfmac); iwd is not used
+wireless-regdb
+firewalld
+avahi
+nss-mdns
+
+# --- Bluetooth ---
+bluez
+
+# --- Power. Profiles come from the base's tuned + tuned-ppd: power-profiles-daemon conflicts with
+# tuned-ppd, so it is deliberately absent ---
+tuned
+tuned-ppd
+upower
+zram-generator
+bolt
+
+# --- Printing (driverless/IPP Everywhere; see /etc/cups/cups-browsed.conf) ---
+cups
+cups-browsed
+cups-filters
+cups-pk-helper              # PolicyKit-authenticated printer administration
+
+# --- Storage ---
+btrfs-progs
+dosfstools
+exfatprogs
+
+# --- Containers ---
+moby-engine
+docker-compose
+docker-buildx
+
+# --- Provisioning (first-boot Flatpak preinstall; Homebrew ships prebuilt from ublue's image) ---
+flatpak
+curl                        # silverblue-asahi-online's HTTPS check
+dbus-tools                  # dbus-run-session: the Flatpak units need a session bus (see the units)
+dbus-daemon                 # ...which dbus-run-session starts; the base runs dbus-broker and ships neither
+
+# --- Console and base CLI ---
+plymouth
+zsh                         # this image's own accounts get bash; see the note below
+terminus-fonts-console
+sudo
+less
+man-db
+vim-minimal                 # provides `vi` for $EDITOR fallbacks
+unzip
+wget2-wget
+util-linux-script
+plocate
+git
+jq
+python3-pip
+inotify-tools
+socat
+
+# zsh is here for accounts that arrive by `bootc switch` from an image whose accounts log in with
+# zsh. Their passwd entry keeps /usr/bin/zsh, while /etc/shells follows the new image. accountsservice
+# counts an account whose shell is not in /etc/shells as a system account, so without zsh GDM would
+# list no users and start GNOME Initial Setup on a machine that already has one, which ends with a
+# second, empty account.

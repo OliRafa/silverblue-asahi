@@ -1,0 +1,99 @@
+#!/bin/bash
+# Real `bootc install to-disk` of an image onto a loopback file, then inspect the result by mounting
+# it: systemd-boot on the ESP (no GRUB), a kernel staged under EFI/Linux, the composefs-native
+# deployment root (/composefs, /ostree, /state), and a deployment /etc whose machine-id is still an
+# empty file, so the installed system generates its ID on the first boot without systemd-firstboot's
+# console prompts. This is the shipping install path, minus the Asahi preboot layer
+# (deploy/tests/esp-bootc-integration.sh covers that).
+#
+# Needs root, loop devices and rootful podman with the image in /var/lib/containers:
+#   sudo ./images/silverblue-asahi/hack/install-to-disk.sh [IMAGE] [WORKDIR]
+set -euo pipefail
+IMAGE="${1:-silverblue-asahi:44}"
+WORKDIR="${2:-/var/tmp/silverblue-asahi-install-to-disk}"
+ENGINE="${ENGINE:-podman}"
+
+mkdir -p "$WORKDIR"
+disk="$WORKDIR/disk.raw"
+rm -f "$disk"
+truncate -s 20G "$disk"
+
+echo "== bootc install to-disk: $IMAGE =="
+"$ENGINE" run --rm --privileged --pid=host \
+  --security-opt label=type:unconfined_t \
+  -v /var/lib/containers:/var/lib/containers -v /dev:/dev \
+  -v "$WORKDIR":/output \
+  "$IMAGE" \
+  bootc install to-disk \
+    --composefs-backend --bootloader systemd --filesystem btrfs \
+    --generic-image --via-loopback --wipe /output/disk.raw
+
+# Inspect by loopback mount (no libguestfs — its qemu appliance won't launch on the arm runner).
+# p1 = ESP (vfat), p2 = root (btrfs).
+loop=$(losetup -Pf --show "$disk")
+mnt="$WORKDIR/mnt"
+mkdir -p "$mnt/esp" "$mnt/root"
+# Runs as root: leave nothing root-owned behind in WORKDIR for an unprivileged caller to trip over.
+cleanup() {
+  umount "$mnt/esp" 2>/dev/null || true
+  umount "$mnt/root" 2>/dev/null || true
+  losetup -d "$loop" 2>/dev/null || true
+  rmdir "$mnt/esp" "$mnt/root" "$mnt" 2>/dev/null || true
+  rm -f "$disk"
+}
+trap cleanup EXIT
+
+sd=0 grub=0 kern=0 cfs=0 ost=0 st=0 mid=0
+
+mount "${loop}p1" "$mnt/esp"
+echo "--- ESP /EFI ---"
+find "$mnt/esp/EFI" -maxdepth 3 -print 2>/dev/null || true
+# U-Boot (no NVRAM) boots only the removable path, so systemd-boot must be at EFI/BOOT/BOOTAA64.EFI;
+# EFI/systemd/systemd-bootaa64.efi alone would not boot a Mac.
+if [[ -e $mnt/esp/EFI/BOOT/BOOTAA64.EFI ]] && grep -qa 'systemd-boot' "$mnt/esp/EFI/BOOT/BOOTAA64.EFI"; then
+  sd=1
+fi
+[[ -e $mnt/esp/EFI/fedora/grubaa64.efi ]] && grub=1
+[[ -n "$(find "$mnt/esp/EFI/Linux" -name vmlinuz 2>/dev/null | head -1)" ]] && kern=1
+umount "$mnt/esp"
+
+mount "${loop}p2" "$mnt/root"
+echo "--- deployment root ---"
+ls -a "$mnt/root" 2>/dev/null | head
+# composefs-native backend root layout: composefs/ ostree/ state/ (NOT the classic
+# /ostree/repo + /ostree/deploy + .bootc-aleph.json-at-root).
+[[ -d $mnt/root/composefs ]] && cfs=1
+[[ -d $mnt/root/ostree ]] && ost=1
+[[ -d $mnt/root/state ]] && st=1
+# The install copies the image's /etc into state/deploy/<id>/etc. Its machine-id must still be an
+# empty file: absent or "uninitialized" would make the boot a first boot (machine-id(5)), and
+# systemd-firstboot would ask for the locale, keymap, timezone and a root password on the console
+# before GDM, the questions GNOME Initial Setup asks graphically. A real ID would be shared by every
+# machine installed from the image.
+for etc in "$mnt/root"/state/deploy/*/etc; do
+  [[ -d $etc ]] || continue
+  if [[ ! -e $etc/machine-id ]]; then
+    echo "installed /etc/machine-id: absent"
+  else
+    content=$(<"$etc/machine-id")
+    echo "installed /etc/machine-id: '$content'"
+    [[ -f $etc/machine-id && -z $content ]] && mid=1
+  fi
+done
+umount "$mnt/root"
+
+fail=0
+check() { # check <ok> <pass message> <fail message>
+  if (( $1 )); then echo "OK: $2"; else echo "FAIL: $3"; fail=1; fi
+}
+check "$sd" "systemd-boot at EFI/BOOT/BOOTAA64.EFI (the path U-Boot boots)" "EFI/BOOT/BOOTAA64.EFI missing or not systemd-boot"
+check "$(( ! grub ))" "no grub on ESP" "grub present on ESP"
+check "$kern" "kernel staged on ESP" "no kernel on ESP"
+check "$cfs" "/composefs deployment store present" "no /composefs (composefs deploy incomplete)"
+check "$ost" "/ostree present" "no /ostree"
+check "$st" "/state present" "no /state"
+check "$mid" "installed /etc/machine-id is empty: systemd generates the ID, GNOME Initial Setup asks the questions" \
+  "installed /etc/machine-id is not an empty file (or no deployment /etc): see the log line above"
+
+if (( fail == 0 )); then echo "INSTALL-TO-DISK: PASS"; else echo "INSTALL-TO-DISK: FAIL"; fi
+exit "$fail"

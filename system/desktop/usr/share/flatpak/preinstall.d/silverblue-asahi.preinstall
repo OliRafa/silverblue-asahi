@@ -1,0 +1,131 @@
+# silverblue-asahi — GUI apps delivered as Flatpaks on first boot.
+#
+# A Fedora/flatpak-native "preinstall" manifest (see flatpak-preinstall(1)): on every boot,
+# silverblue-asahi-flatpak-preinstall.service runs `flatpak preinstall -y` once the remotes answer
+# over HTTPS (its timer tries 30s after boot, then every 2 minutes) and installs the groups below.
+# The upstream CLI owns the install logic, the idempotency and the opt-out: an app the user
+# uninstalls is remembered and not reinstalled. Apps pin Branch=stable because that is Flathub's
+# branch (the flatpak default, "master", does not exist there and an unpinned group silently
+# installs nothing).
+#
+# Each app comes from the first remote, by priority, that has it for aarch64: Flathub (priority 10),
+# then Fedora's Flatpak registry (priority 1) — set up by silverblue-asahi-flatpak-preinstall.service.
+# A ref no remote has is skipped silently, not retried.
+#
+# Install anything else from GNOME Software, or with `flatpak install flathub <app>`.
+
+# --- GNOME's default apps -------------------------------------------------------------------------
+#
+# The apps Fedora Silverblue's installer adds from Fedora's registry: the Silverblue
+# `flatpak_remote_refs` in pungi-fedora's fedora.conf (branch f44, aarch64). They are not in the
+# image, and `bootc install` runs no installer, so without this list a fresh install would have no
+# calculator, text editor, image viewer or PDF viewer. Keep it in step with that list when the base
+# moves to a new Fedora release. Stock Silverblue installs Fedora's builds of these; here they come
+# from Flathub like the rest of the set, with Fedora's builds as the fallback.
+
+[Flatpak Preinstall org.gnome.baobab]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.Calculator]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.Calendar]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.Characters]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.Snapshot]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.clocks]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.Connections]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.Contacts]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.Extensions]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.font-viewer]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.TextEditor]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.Loupe]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.Logs]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.Maps]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.fedoraproject.MediaWriter]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.NautilusPreviewer]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.Papers]
+Branch=stable
+IsRuntime=false
+
+[Flatpak Preinstall org.gnome.Weather]
+Branch=stable
+IsRuntime=false
+
+# --- Everyday apps ----------------------------------------------------------------------------------
+
+# Browser, next to the image's Firefox. Run `silverblue-asahi-widevine` after its first start to
+# enable DRM (Spotify, Netflix) on aarch64.
+[Flatpak Preinstall com.brave.Browser]
+Branch=stable
+IsRuntime=false
+
+# Password manager.
+[Flatpak Preinstall com.bitwarden.desktop]
+Branch=stable
+IsRuntime=false
+
+# Office suite.
+[Flatpak Preinstall org.libreoffice.LibreOffice]
+Branch=stable
+IsRuntime=false
+
+# Notes.
+[Flatpak Preinstall md.obsidian.Obsidian]
+Branch=stable
+IsRuntime=false
+
+# Send files to nearby devices. Needs TCP+UDP 53317, which the image opens in firewalld
+# (/usr/lib/firewalld/services/localsend.xml).
+[Flatpak Preinstall org.localsend.localsend_app]
+Branch=stable
+IsRuntime=false
+
+# Screen recording and streaming. Flathub builds OBS for x86_64 only, so on Apple Silicon this
+# resolves to Fedora's Flatpak (fedora remote, org.fedoraproject.KDE6Platform runtime).
+[Flatpak Preinstall com.obsproject.Studio]
+Branch=stable
+IsRuntime=false

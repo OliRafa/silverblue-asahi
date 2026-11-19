@@ -1,0 +1,85 @@
+#!/bin/bash
+# First-boot provisioning: hand Homebrew to the primary user and apply the silverblue-asahi Brewfile.
+#
+# Homebrew itself is NOT installed here. It ships prebuilt in the image at
+# /usr/share/homebrew.tar.zst (Universal Blue's brew image, the same one Bluefin and Bazzite use),
+# and ublue's own brew-setup.service unpacks it into /home/linuxbrew before this runs. Two things
+# are left over, and they are ours:
+#
+#  1. OWNERSHIP. Their extract does `chown -R 1000:1000`, a fixed uid. That is right on nearly every
+#     machine — useradd hands the first human account 1000 — but it is an assumption, not a fact,
+#     and a brew prefix owned by the wrong uid is a brew that cannot install anything. Re-chown to
+#     the account we actually detect; a no-op when the uid really is 1000.
+#  2. THE BREWFILE. ublue ship no package list; ours defines nvim, tmux, gh and the other CLI tools
+#     that live in the user-writable brew prefix rather than the immutable image.
+#
+# Why this does not run Homebrew's installer: every brew failure seen on this platform was a
+# first-boot network failure, and the last one was silent — `/bin/bash -c "$(curl ...)"` exits 0
+# when the curl fails. An image that already contains Homebrew cannot fail that way.
+set -uo pipefail
+
+# Paths are overridable so this can be exercised off-hardware; see test/unit.d/brew-setup-test.sh.
+BREWFILE="${SILVERBLUE_ASAHI_BREW_FILE:-/usr/share/silverblue-asahi/Brewfile}"
+STAMP="${SILVERBLUE_ASAHI_BREW_STAMP:-/var/lib/silverblue-asahi/brew-setup-done}"
+PREFIX="${SILVERBLUE_ASAHI_BREW_PREFIX:-/home/linuxbrew/.linuxbrew}"
+# Prints "UID NAME" of the primary user; it reads SILVERBLUE_ASAHI_LOGIN_DEFS itself.
+PRIMARY_USER="${SILVERBLUE_ASAHI_PRIMARY_USER:-/usr/libexec/silverblue-asahi-primary-user}"
+# ublue's "already unpacked" marker; brew-setup.service is gated on it not existing.
+BREW_MARKER="${SILVERBLUE_ASAHI_BREW_MARKER:-/etc/.linuxbrew}"
+BREW="$PREFIX/bin/brew"
+
+[[ -f $BREWFILE ]] || { echo "brew-setup: no Brewfile at $BREWFILE"; exit 0; }
+[[ -f $STAMP ]] && exit 0
+
+# The primary user: GNOME Initial Setup's account, the lowest uid in login.defs' range with a real
+# login shell (see silverblue-asahi-primary-user for why the range and the field matter). The unit
+# runs the same helper as an ExecCondition, so from the timer this only finds no one if the account
+# went away in between; a manual run before GNOME Initial Setup has finished gets here too.
+if ! read -r uid user < <("$PRIMARY_USER" 2>/dev/null) || [[ -z ${user:-} ]]; then
+  echo "brew-setup: no primary user yet; the timer retries once GNOME Initial Setup has created it"
+  exit 0   # no stamp -> retry
+fi
+
+# An EMPTY prefix is worse than no prefix. ublue's brew-setup.service is gated on
+#   ConditionPathExists=!/home/linuxbrew/.linuxbrew
+# so a leftover directory makes the unpack skip — silently, forever. Clear it, and clear ublue's
+# /etc/.linuxbrew marker with it — a marker claiming the unpack is done while the prefix is empty is
+# simply wrong. Guarded tightly: a prefix holding either bin/brew or Homebrew/ is a real install and
+# is never touched.
+if [[ ! -x $BREW && -d $PREFIX ]]; then
+  # -L as well as -e: bin/brew in the shipped tree is a SYMLINK into Homebrew/, and -e follows it.
+  # Only a prefix with no bin/brew entry at all and no Homebrew/ is unambiguously an empty debris
+  # directory.
+  if [[ ! -e $PREFIX/bin/brew && ! -L $PREFIX/bin/brew && ! -d $PREFIX/Homebrew ]]; then
+    echo "brew-setup: $PREFIX exists but holds no Homebrew — clearing it so brew-setup.service can unpack on the next try"
+    rm -rf "$PREFIX"
+    rmdir "$(dirname "$PREFIX")" 2>/dev/null || true
+    rm -f "$BREW_MARKER"
+  fi
+fi
+
+# The image ships Homebrew; if it is not unpacked, ublue's brew-setup.service has not run or has
+# failed. Say so, rather than blaming the bundle two commands later, and fail: the unit restarts
+# after its delay, queueing brew-setup.service again first (Wants=).
+if [[ ! -x $BREW ]]; then
+  echo "brew-setup: $BREW is missing — brew-setup.service has not unpacked /usr/share/homebrew.tar.zst." >&2
+  echo "brew-setup: check it with: systemctl status brew-setup.service" >&2
+  exit 1
+fi
+
+# ublue's extract chowns to a hardcoded 1000:1000. Point it at the account we detected instead.
+owner="$(stat -c %u "$PREFIX" 2>/dev/null || echo '')"
+if [[ $owner != "$uid" ]]; then
+  echo "brew-setup: re-owning $PREFIX to $user ($uid), was uid ${owner:-unknown}"
+  chown -R "$user" "$PREFIX" || { echo "brew-setup: could not chown $PREFIX" >&2; exit 1; }
+fi
+
+# Call brew by absolute path. Relying on `brew` being on PATH after shellenv means a prefix problem
+# surfaces as "brew: command not found" from a login shell, which reads like a PATH bug.
+echo "brew-setup: applying $BREWFILE as $user"
+su - "$user" -c "eval \"\$('$BREW' shellenv)\"; '$BREW' bundle --file='$BREWFILE'" \
+  || { echo "brew-setup: brew bundle failed" >&2; exit 1; }
+
+mkdir -p "$(dirname "$STAMP")"
+date -u +%FT%TZ >"$STAMP"
+echo "brew-setup: done"

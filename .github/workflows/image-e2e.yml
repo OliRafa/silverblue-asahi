@@ -1,0 +1,125 @@
+name: Image e2e
+
+# Builds the image from source, runs the container smoke tests, and validates a real
+# `bootc install to-disk` (composefs-native + systemd-boot — the shipping bootloader) by
+# loopback-mounting the installed disk. aarch64 runner because the image is Apple-Silicon /
+# Fedora Asahi only. On main (a push, the weekly run or a manual run) it then hands the tested image
+# to publish.yml.
+#
+# Not covered here (needs a real Mac): the physical boot, GDM and GNOME Initial Setup, and the
+# first-boot services — the Asahi kernel won't boot in generic qemu. That's the on-hardware
+# images/boottest/ harness.
+on:
+  push:
+    paths:
+      - 'images/**'
+      - 'system/**'
+      - 'packages/**'
+      - 'deploy/**'
+      - 'Brewfile'
+      - '.github/workflows/image-e2e.yml'
+      - '.github/workflows/publish.yml'
+  pull_request:
+    paths:
+      - 'images/**'
+      - 'system/**'
+      - 'packages/**'
+      - 'deploy/**'
+      - 'Brewfile'
+      - '.github/workflows/image-e2e.yml'
+      - '.github/workflows/publish.yml'
+  schedule:
+    - cron: '0 6 * * 1'   # weekly: base-image, kernel and security updates; publish follows on success
+  workflow_dispatch:
+
+# A newer push supersedes the run in progress, except on main: there the run ends in a publish,
+# which must not be cut off halfway, so a newer run waits for it instead.
+concurrency:
+  group: image-e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    # packages: write is for the last step only, which hands the tested image to publish.yml from
+    # main; on a pull request that step does not run.
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.handoff.outputs.digest }}
+    steps:
+      # The job can push to GHCR, and machines pull what lands there, so keep the token out of
+      # .git/config (the push step logs in on its own) and pin third-party actions to a commit.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Free up runner disk (image builds + bootc install-to-disk are space-hungry)
+        uses: jlumbroso/free-disk-space@cf1e78c50ca91e757bab3edc229027eebfc07871   # main, 2026-11-15
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Install podman + disk tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman btrfs-progs dosfstools gdisk
+
+      # Rootful podman throughout: `bootc install` reads the image from /var/lib/containers, so the
+      # image must be built into root storage (sudo) and the scripts run under sudo.
+      - name: Build the image (bootc container lint runs in-build)
+        run: sudo env ENGINE=podman ./images/build.sh
+
+      - name: Platform smoke test
+        run: sudo env ENGINE=podman ./images/silverblue-asahi/hack/platform-smoke.sh silverblue-asahi:44
+
+      # GDM, GNOME Initial Setup, GNOME Software's plugins, Firefox's Widevine wiring, the Flatpak set.
+      - name: Desktop smoke test
+        run: sudo env ENGINE=podman ./images/silverblue-asahi/hack/desktop-smoke.sh silverblue-asahi:44
+
+      - name: bootc install to-disk (composefs + systemd-boot) + deploy assertions
+        run: sudo env ENGINE=podman ./images/silverblue-asahi/hack/install-to-disk.sh silverblue-asahi:44 "$RUNNER_TEMP/out"
+
+      # Real-bootc proxy for the install wrapper: `bootc install to-filesystem` onto a loopback disk
+      # whose ESP is pre-populated like a real Asahi ESP. Proves esp_backup/esp_restore preserve the
+      # preboot layer around an ACTUAL install. The work dir must be a real directory inside the
+      # image (/home is a symlink to /var/home there), hence /var/tmp.
+      - name: bootc install to-filesystem — ESP preboot preservation (real bootc)
+        run: |
+          sudo rm -rf "$RUNNER_TEMP/out"   # the install-to-disk step ran as root
+          sudo env ENGINE=podman bash deploy/tests/esp-bootc-integration.sh silverblue-asahi:44 /var/tmp/esp-int
+
+      - name: Build the on-hardware boot-test overlay
+        run: sudo podman build -t silverblue-asahi:44-boottest --build-arg BASE=silverblue-asahi:44 -f images/boottest/Containerfile .
+
+      # Hand the image every step above tested to publish.yml as the immutable :44-<sha> tag, so
+      # what gets published is these exact bytes, not a second build. main only, like the publish job.
+      - name: Push the tested image for publishing
+        id: handoff
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}" sha="${GITHUB_SHA::12}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | sudo podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          sudo podman push --digestfile "$RUNNER_TEMP/image.digest" silverblue-asahi:44 "docker://ghcr.io/$owner/silverblue-asahi:44-$sha"
+          echo "digest=$(cat "$RUNNER_TEMP/image.digest")" >> "$GITHUB_OUTPUT"
+
+  # Publish what e2e just tested, from main and never for a pull request. Called rather than chained
+  # with workflow_run, so the digest e2e pushed reaches it directly.
+  publish:
+    needs: e2e
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/publish.yml
+    with:
+      digest: ${{ needs.e2e.outputs.digest }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    secrets: inherit

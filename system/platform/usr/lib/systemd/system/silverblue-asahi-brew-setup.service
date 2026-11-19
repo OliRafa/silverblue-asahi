@@ -1,0 +1,51 @@
+[Unit]
+Description=Apply the silverblue-asahi Brewfile (first boot)
+# Homebrew ships prebuilt in the image; ublue's brew-setup.service unpacks it into /home/linuxbrew.
+# This only re-owns that prefix to the detected primary user and applies our Brewfile, so it must
+# run after the unpack and once the account exists. The unpack is ordering only — if it has not
+# happened the helper says so and a later run retries, rather than being silently skipped by a
+# Requires=.
+#
+# Wants= as well, so every try (a timer start or a restart) queues the unpack again first. Once it
+# has run, its ConditionPathExists=! guards skip it at once; if the helper has just cleared an empty
+# prefix and ublue's marker, the next try unpacks Homebrew in this boot instead of the next one.
+Wants=brew-setup.service
+After=brew-setup.service
+# No [Install] section: silverblue-asahi-brew-setup.timer starts this 30s after boot, then 2 minutes
+# after each run its conditions skipped, until the account exists and the network is up.
+
+[Service]
+Type=oneshot
+# A run that succeeds stays active, which is what stops the timer from starting it again this boot.
+RemainAfterExit=yes
+# The account comes from GNOME Initial Setup, which runs at the first login screen, so on a fresh
+# install every start before the user has finished it finds nobody to hand Homebrew to. Skip until
+# the account exists (silverblue-asahi-primary-user exits 1 meanwhile), and the timer tries again 2
+# minutes later; an ordering on a unit could not express "after the user filled in a form".
+ExecCondition=/usr/libexec/silverblue-asahi-primary-user
+# Wait for the network here rather than at network-online.target, which the image's masked
+# NetworkManager-wait-online makes a no-op: offline `brew bundle` fails, and on a fresh install
+# Wi-Fi is not configured until the user sets it up in the session. Once the Brewfile has been
+# applied (the helper's stamp) pass at once, so a provisioned machine makes one instant no-op run
+# per boot and the timer stops; until then run only when Homebrew's API and bottle hosts answer over
+# HTTPS (silverblue-asahi-online). Never a ConditionPathExists=! on the stamp (or the account) instead: a
+# unit skipped by Condition*= makes the timer start it again every 2 minutes for the rest of the boot.
+ExecCondition=/usr/bin/bash -c '[[ -f /var/lib/silverblue-asahi/brew-setup-done ]] || exec /usr/libexec/silverblue-asahi-online formulae.brew.sh ghcr.io'
+# A `brew bundle` that fails with the network up (a formula that does not build, a download that
+# broke off) is retried after a growing delay, 5 minutes up to 2 hours over five tries, not every 2
+# minutes for the rest of the boot: some aarch64 formulae build from source. A skip by the condition
+# above is not a failure, so it never restarts; the timer covers that.
+#
+# RestartMode=direct keeps the unit "activating" between tries. Without it each failure leaves the
+# unit inactive for an instant, the timer's OnUnitInactiveSec= arms, and 2 minutes later its start
+# cuts the delay short and resets the backoff (seen on systemd 259). The price: while it retries the
+# unit never shows as failed, even when the failure is a broken condition (silverblue-asahi-online
+# exits 255, which counts as a failure too); each failed try is in the journal.
+Restart=on-failure
+RestartMode=direct
+RestartSec=5min
+RestartSteps=5
+RestartMaxDelaySec=2h
+# brew bundle can take a while on first boot (some aarch64 formulae build from source).
+TimeoutStartSec=infinity
+ExecStart=/usr/libexec/silverblue-asahi-brew-setup
