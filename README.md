@@ -43,7 +43,7 @@ sudo reboot
 2. The Flatpak apps install in the background as soon as the network is up (system-wide, so they need no account, and may already be installing during setup), and the Brewfile once the account exists too: until Flathub, Fedora's registry and Homebrew's servers answer over HTTPS, each is tried again every couple of minutes, so connecting to Wi-Fi during setup is enough. A Brewfile that fails to apply is tried again after a growing delay (5 minutes, up to 2 hours).
 3. A reboot or two later, `silverblue-asahi-apply-m1n1` has refreshed m1n1 and the devicetree for the installed kernel.
 
-For DRM video (Spotify, Netflix): run `silverblue-asahi-widevine` once and restart Firefox. For Brave, open it once first, then run the command.
+For DRM video (Spotify, Netflix): run `silverblue-asahi-widevine` once and restart Firefox. For Brave, open it once first, then quit it and run the command.
 
 ## Update
 

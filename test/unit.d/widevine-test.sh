@@ -6,7 +6,8 @@
 #
 # The detail that cost real debugging: the hint file's Path must be the CANONICAL path the sandboxed
 # browser resolves — /var/home/<user>/..., not the /home symlink. A /home path makes Chromium log
-# "Widevine enabled but no library found" and skip the CDM.
+# "Widevine enabled but no library found" and skip the CDM. And Brave reads its opt-in only from
+# Local State; the same key in the profile's Preferences is ignored and Widevine stays off.
 
 source "$(dirname "$0")/base-test.sh"
 require_command jq
@@ -66,24 +67,34 @@ hint="$(cat "$profile/WidevineCdm/latest-component-updated-widevine-cdm")"
 [[ $hint != *"$link_home"* ]] || fail "the hint must not use the /home symlink" "$hint"
 pass "the hint file uses the canonical path the sandbox resolves"
 
-optin="$(jq -r '.brave.widevine_opted_in' "$profile/Default/Preferences")"
-[[ $optin == "true" ]] || fail "Brave's widevine_opted_in pref is set" "got: $optin"
-pass "Brave's Widevine opt-in pref is set"
+optin="$(jq -r '.brave.widevine_opted_in' "$profile/Local State")"
+[[ $optin == "true" ]] || fail "Brave's widevine_opted_in is set in Local State" "got: $optin"
+[[ ! -e $profile/Default/Preferences ]] || fail "the opt-in is not written to the profile's Preferences, which Brave ignores"
+pass "Brave's Widevine opt-in is set in Local State"
 
-# 2) An existing Preferences file keeps its other keys.
-printf '{"homepage":"https://example.com","brave":{"other":1}}' >"$profile/Default/Preferences"
+# 2) An existing Local State keeps its other keys.
+printf '{"browser":{"enabled_labs_experiments":["x"]},"brave":{"other":1}}' >"$profile/Local State"
 run_tool bash "$tool" --wire-only || fail "re-wiring succeeds"
-[[ "$(jq -r '.homepage' "$profile/Default/Preferences")" == "https://example.com" ]] || fail "unrelated prefs survive"
-[[ "$(jq -r '.brave.other' "$profile/Default/Preferences")" == "1" ]] || fail "sibling brave.* prefs survive"
-[[ "$(jq -r '.brave.widevine_opted_in' "$profile/Default/Preferences")" == "true" ]] || fail "the opt-in is merged in"
-pass "the opt-in is merged into existing preferences"
+[[ "$(jq -r '.browser.enabled_labs_experiments[0]' "$profile/Local State")" == "x" ]] || fail "unrelated Local State keys survive"
+[[ "$(jq -r '.brave.other' "$profile/Local State")" == "1" ]] || fail "sibling brave.* keys survive"
+[[ "$(jq -r '.brave.widevine_opted_in' "$profile/Local State")" == "true" ]] || fail "the opt-in is merged in"
+pass "the opt-in is merged into an existing Local State"
 
-# 3) A running browser gets the restart notice.
+# 3) A running, already opted-in browser just gets the restart notice.
 MOCK_RUNNING=1 run_tool bash "$tool" --wire-only || fail "wiring with Brave running succeeds"
 grep -q 'still running' "$test_tmp/out.log" || fail "a running browser gets a restart notice" "$(cat "$test_tmp/out.log")"
+! grep -q 'brave://settings/extensions' "$test_tmp/out.log" || fail "no opt-in notice once Brave is opted in" "$(cat "$test_tmp/out.log")"
 pass "a running browser is told to restart"
 
-# 4) --wire-only with no CDM is a quiet no-op and never escalates.
+# 4) A running Brave that is not opted in keeps its Local State untouched (it would overwrite the
+#    edit on exit) and the user is told how to finish.
+printf '{"brave":{"other":1}}' >"$profile/Local State"
+MOCK_RUNNING=1 run_tool bash "$tool" --wire-only || fail "wiring with Brave running succeeds"
+[[ "$(cat "$profile/Local State")" == '{"brave":{"other":1}}' ]] || fail "Local State is left alone while Brave runs" "$(cat "$profile/Local State")"
+grep -q 'brave://settings/extensions' "$test_tmp/out.log" || fail "the user is told to quit Brave or use its toggle" "$(cat "$test_tmp/out.log")"
+pass "a running Brave's Local State is left alone, with instructions to finish"
+
+# 5) --wire-only with no CDM is a quiet no-op and never escalates.
 rm -f "$cdm/libwidevinecdm.so"
 : >"$test_tmp/mock.log"
 run_tool bash "$tool" --wire-only || fail "--wire-only without a CDM exits 0"

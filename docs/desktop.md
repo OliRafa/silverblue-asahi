@@ -52,7 +52,7 @@ Docker (Fedora's `moby-engine`, with Compose and Buildx) starts on demand throug
 
 ## DRM (Widevine)
 
-Run `silverblue-asahi-widevine` once to fetch the arm64 Widevine CDM, then restart the browser. Firefox needs nothing else; for Brave (and other Chromium-family Flatpaks), start the browser once before running the command, so it has a profile to wire the CDM into. Details in [asahi.md](asahi.md#drm-widevine).
+Run `silverblue-asahi-widevine` once to fetch the arm64 Widevine CDM, then restart the browser. Firefox needs nothing else; for Brave (and other Chromium-family Flatpaks), start the browser once before running the command, so it has a profile to wire the CDM into, and quit Brave before running it. Details in [asahi.md](asahi.md#drm-widevine).
 
 ## SSH
 

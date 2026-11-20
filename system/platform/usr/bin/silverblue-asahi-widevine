@@ -42,7 +42,7 @@ CHROMIUM_FLATPAKS=(
 )
 
 running_browsers=()
-brave_running=0
+brave_optin_pending=0
 
 # A usable CDM needs both the library and its manifest. Requiring both keeps --wire-only a clean
 # no-op on a half-installed CDM instead of letting jq abort.
@@ -54,19 +54,29 @@ flatpak_running() {
   flatpak ps --columns=application 2>/dev/null | grep -qx "$1"
 }
 
+# Brave reads its Widevine opt-in from Local State (the browser-wide file next to the profiles), not
+# from a profile's Preferences. A running Brave rewrites Local State when it quits, so an edit made
+# while it runs is lost; leave it for a run with Brave closed.
 enable_brave_optin() {
-  local prefs="$1"
-  if [[ -f $prefs ]]; then
+  local state="$1" running="$2"
+  if [[ -f $state ]] && jq -e '.brave.widevine_opted_in == true' "$state" >/dev/null 2>&1; then
+    return
+  fi
+  if (( running )); then
+    brave_optin_pending=1
+    return
+  fi
+  if [[ -f $state ]]; then
     local tmp
     tmp=$(mktemp)
-    if jq '.brave = (.brave // {}) | .brave.widevine_opted_in = true' "$prefs" >"$tmp" 2>/dev/null; then
-      mv -f "$tmp" "$prefs"
+    if jq '.brave = (.brave // {}) | .brave.widevine_opted_in = true' "$state" >"$tmp" 2>/dev/null; then
+      mv -f "$tmp" "$state"
     else
       rm -f "$tmp"
     fi
   else
-    mkdir -p "$(dirname "$prefs")"
-    printf '{"brave":{"widevine_opted_in":true}}' >"$prefs"
+    mkdir -p "$(dirname "$state")"
+    printf '{"brave":{"widevine_opted_in":true}}' >"$state"
   fi
 }
 
@@ -80,9 +90,14 @@ wire_browser() {
   home="$(readlink -f "$HOME")"
   local profile="$home/.var/app/$appid/config/$subdir"
   local wv_dir="$profile/WidevineCdm"
-  local version dest
+  local version dest running=0
   version=$(jq -r '.version' "$CDM_MANIFEST")
   dest="$wv_dir/$version"
+
+  if flatpak_running "$appid"; then
+    running=1
+    running_browsers+=("$appid")
+  fi
 
   echo "  Wiring $appid"
   mkdir -p "$dest/_platform_specific/linux_arm64"
@@ -91,14 +106,7 @@ wire_browser() {
   printf '{"Path":"%s"}' "$dest" >"$wv_dir/latest-component-updated-widevine-cdm"
 
   if (( is_brave )); then
-    enable_brave_optin "$profile/Default/Preferences"
-  fi
-
-  if flatpak_running "$appid"; then
-    running_browsers+=("$appid")
-    if (( is_brave )); then
-      brave_running=1
-    fi
+    enable_brave_optin "$profile/Local State" "$running"
   fi
 }
 
@@ -145,8 +153,9 @@ fi
 echo
 if (( ${#running_browsers[@]} )); then
   echo "Note: ${running_browsers[*]} still running — fully quit it (not just close the window) and reopen so the CDM loads."
-  if (( brave_running )); then
-    echo "If DRM content still won't play in Brave afterwards, run this command again once Brave is fully closed."
+  if (( brave_optin_pending )); then
+    echo "Brave's Widevine setting is still off: Brave rewrites it when it quits. Quit Brave fully and run"
+    echo "this again, or turn on Widevine in brave://settings/extensions."
   fi
 else
   echo "Done. Restart your browsers (Firefox included), then DRM sites (Spotify, Netflix) will play."
